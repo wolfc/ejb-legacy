@@ -25,12 +25,20 @@ import org.jboss.aop.Advisor;
 import org.jboss.aop.AspectManager;
 import org.jboss.aop.AspectXmlLoader;
 import org.jboss.aop.ClassAdvisor;
+import org.jboss.aop.Dispatcher;
+import org.jboss.aop.joinpoint.Invocation;
+import org.jboss.aop.joinpoint.InvocationResponse;
+import org.jboss.aop.joinpoint.MethodInvocation;
 import org.jboss.aspects.remoting.AOPRemotingInvocationHandler;
+import org.jboss.ejb3.common.lang.SerializableMethod;
 import org.jboss.ejb3.common.metadata.MetadataUtil;
 import org.jboss.ejb3.common.registrar.spi.Ejb3Registrar;
 import org.jboss.ejb3.common.registrar.spi.Ejb3RegistrarLocator;
 import org.jboss.ejb3.proxy.impl.jndiregistrar.JndiStatelessSessionRegistrar;
 import org.jboss.ejb3.proxy.impl.objectfactory.session.stateless.StatelessSessionProxyObjectFactory;
+import org.jboss.ejb3.proxy.impl.remoting.SessionSpecRemotingMetadata;
+import org.jboss.ejb3.proxy.spi.container.InvokableContext;
+import org.jboss.logging.Logger;
 import org.jboss.metadata.ejb.jboss.JBossEnterpriseBeansMetaData;
 import org.jboss.metadata.ejb.jboss.JBossMetaData;
 import org.jboss.metadata.ejb.jboss.JBossSessionBeanMetaData;
@@ -42,8 +50,10 @@ import org.junit.Test;
 
 import javax.naming.InitialContext;
 import java.net.URL;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
 
@@ -51,6 +61,8 @@ import static org.junit.Assert.assertEquals;
  * @author <a href="mailto:cdewolf@redhat.com">Carlo de Wolf</a>
  */
 public class GreeterTestCase {
+    private static final Logger log = Logger.getLogger(GreeterTestCase.class);
+
     private static JBossSessionBeanMetaData createMetaData() {
         final JBossMetaData jarMetaData = new JBossMetaData();
         jarMetaData.setEjbVersion("3.0");
@@ -86,19 +98,50 @@ public class GreeterTestCase {
     public void testHello() throws Exception {
         final Ejb3Registrar ejb3Registrar = new InMemoryEjb3Registrar();
         Ejb3RegistrarLocator.bindRegistrar(ejb3Registrar);
+        // Remoting
         createRemotingConnector();
 
         // AOP
         final URL url = Thread.currentThread().getContextClassLoader().getResource("ejb3-interceptors-aop.xml");
         AspectXmlLoader.deployXML(url);
 
+        // JNDI
         final SingletonNamingServer namingServer = new SingletonNamingServer();
         final InitialContext context = new InitialContext();
-        final JndiStatelessSessionRegistrar registrar = new JndiStatelessSessionRegistrar(StatelessSessionProxyObjectFactory.class.getName());
+
+        // per EJB stuff starts here
+        // Create incoming meta data
         final JBossSessionBeanMetaData smd = createMetaData();
-        final ClassLoader cl = Thread.currentThread().getContextClassLoader();
         final String containerName = smd.getName();
-        final String containerGuid = null;
+
+        // Register with AOP
+        final ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        Dispatcher.singleton.registerTarget(containerName, new InvokableContextClassProxyHack(new InvokableContext() {
+            @Override
+            public Object invoke(Object proxy, SerializableMethod method, Object[] args) throws Throwable {
+                throw new RuntimeException("NYI: .invoke");
+            }
+
+            @Override
+            public InvocationResponse dynamicInvoke(Invocation invocation) throws Throwable {
+                final MethodInvocation si = (MethodInvocation) invocation;
+                final SerializableMethod invokedMethod = (SerializableMethod) si.getMetaData(SessionSpecRemotingMetadata.TAG_SESSION_INVOCATION,SessionSpecRemotingMetadata.KEY_INVOKED_METHOD);
+                final Class<?> invokedBusinessInterface = Class.forName(invokedMethod.getActualClassName(), false, cl);
+                log.info("Invoked business interface = " + invokedBusinessInterface);
+                log.info("Invoked method = " + si.getActualMethod());
+                log.info("Arguments = " + Arrays.toString(si.getArguments()));
+
+                // business logic
+                final Object result = "Hi " + si.getArguments()[0];
+
+                final InvocationResponse response = new InvocationResponse(result);
+                //response.setContextInfo();
+                return response;
+            }
+        }));
+
+        final JndiStatelessSessionRegistrar registrar = new JndiStatelessSessionRegistrar(StatelessSessionProxyObjectFactory.class.getName());
+        final String containerGuid = containerName + ":" + UUID.randomUUID().toString();
         final AspectManager aspectManager = AspectManager.instance(cl);
         // TODO: probably ClassAdvisor won't do
         final Advisor advisor = new ClassAdvisor(Object.class, aspectManager);
